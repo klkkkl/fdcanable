@@ -17,6 +17,19 @@
                     "imageFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}"
                 }
             ]
+        },
+        {
+            "type": "stlinkgdbtarget",
+            "request": "launch",
+            "name": "Attach",
+            "origin": "snippet",
+            "cwd": "${workspaceFolder}",
+            "serverReset": "None",
+            "imagesAndSymbols": [
+                {
+                    "symbolFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}"
+                }
+            ]
         }
     ]
 }
