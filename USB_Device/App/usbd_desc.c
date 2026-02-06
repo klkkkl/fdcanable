@@ -64,9 +64,9 @@
 
 #define USBD_VID     0x16d0
 #define USBD_LANGID_STRING     1033
-#define USBD_MANUFACTURER_STRING     "STMicroelectronics"
+#define USBD_MANUFACTURER_STRING     "TONWOO"
 #define USBD_PID     0x117e
-#define USBD_PRODUCT_STRING     "16e7497-dirty github.com/normaldotcom/canable2.git"
+#define USBD_PRODUCT_STRING     "FDCANABLE"
 #define USBD_CONFIGURATION_STRING     "CDC Config"
 #define USBD_INTERFACE_STRING     "CDC Interface"
 

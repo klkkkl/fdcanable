@@ -37,16 +37,127 @@ static const uint32_t len2dlc[] = {
     FDCAN_DLC_BYTES_64, FDCAN_DLC_BYTES_64};
 
 typedef struct {
-  uint32_t nominalBitrate;
-  uint32_t dataBitrate;
+  uint8_t nominalIdx; /* 标称波特率索引 (0-8) */
+  uint8_t dataIdx;    /* 数据波特率索引 (0-4) */
   uint8_t isDataBitrateSet;
   uint8_t isOpen;
 } FDCAN_Config_t;
 
-static FDCAN_Config_t mCfg = {.nominalBitrate = 500000,
+static FDCAN_Config_t mCfg = {.nominalIdx = 6, /* 默认 S6: 500 kbps */
+                              .dataIdx = 1,    /* 默认 Y2: 2 Mbps */
                               .isDataBitrateSet = 1,
-                              .dataBitrate = 2000000,
                               .isOpen = 0};
+
+/**
+ * 预计算的 FDCAN 位时序配置
+ * 时钟源: 160 MHz
+ * 采样点: 80%
+ * 公式: 波特率 = 时钟 / (Prescaler * (1 + TimeSeg1 + TimeSeg2))
+ *       采样点 = (1 + TimeSeg1) / (1 + TimeSeg1 + TimeSeg2)
+ */
+typedef struct {
+  uint32_t bitrate;   /* 波特率 (bps) */
+  uint16_t prescaler; /* 预分频器 1-512 */
+  uint8_t timeSeg1;   /* 时间段1 1-256 */
+  uint8_t timeSeg2;   /* 时间段2 1-128 */
+  uint8_t sjw;        /* 同步跳转宽度 1-128 */
+} FDCAN_TimingConfig_t;
+
+/* 标称波特率时序配置表 (SLCAN S0-S8) - 160 MHz, 80% 采样点 */
+static const FDCAN_TimingConfig_t nom_timing_table[] = {
+    /* S0: 10 kbps   - 160MHz / (100 * 160) = 10000, SP = 128/160 = 80% */
+    {.bitrate = 10000,
+     .prescaler = 100,
+     .timeSeg1 = 127,
+     .timeSeg2 = 32,
+     .sjw = 16},
+    /* S1: 20 kbps   - 160MHz / (50 * 160) = 20000, SP = 128/160 = 80% */
+    {.bitrate = 20000,
+     .prescaler = 50,
+     .timeSeg1 = 127,
+     .timeSeg2 = 32,
+     .sjw = 16},
+    /* S2: 50 kbps   - 160MHz / (20 * 160) = 50000, SP = 128/160 = 80% */
+    {.bitrate = 50000,
+     .prescaler = 20,
+     .timeSeg1 = 127,
+     .timeSeg2 = 32,
+     .sjw = 16},
+    /* S3: 100 kbps  - 160MHz / (10 * 160) = 100000, SP = 128/160 = 80% */
+    {.bitrate = 100000,
+     .prescaler = 10,
+     .timeSeg1 = 127,
+     .timeSeg2 = 32,
+     .sjw = 16},
+    /* S4: 125 kbps  - 160MHz / (8 * 160) = 125000, SP = 128/160 = 80% */
+    {.bitrate = 125000,
+     .prescaler = 8,
+     .timeSeg1 = 127,
+     .timeSeg2 = 32,
+     .sjw = 16},
+    /* S5: 250 kbps  - 160MHz / (4 * 160) = 250000, SP = 128/160 = 80% */
+    {.bitrate = 250000,
+     .prescaler = 4,
+     .timeSeg1 = 127,
+     .timeSeg2 = 32,
+     .sjw = 16},
+    /* S6: 500 kbps  - 160MHz / (2 * 160) = 500000, SP = 128/160 = 80% */
+    {.bitrate = 500000,
+     .prescaler = 2,
+     .timeSeg1 = 127,
+     .timeSeg2 = 32,
+     .sjw = 16},
+    /* S7: 800 kbps  - 160MHz / (4 * 50) = 800000, SP = 40/50 = 80% */
+    {.bitrate = 800000,
+     .prescaler = 4,
+     .timeSeg1 = 39,
+     .timeSeg2 = 10,
+     .sjw = 10},
+    /* S8: 1000 kbps - 160MHz / (2 * 80) = 1000000, SP = 64/80 = 80% */
+    {.bitrate = 1000000,
+     .prescaler = 2,
+     .timeSeg1 = 63,
+     .timeSeg2 = 16,
+     .sjw = 16},
+};
+#define STD_BITRATE_COUNT                                                      \
+  (sizeof(nom_timing_table) / sizeof(nom_timing_table[0]))
+
+/* FD 数据波特率时序配置表 (Y1-Y5) - 160 MHz, 80% 采样点 */
+static const FDCAN_TimingConfig_t data_timing_table[] = {
+    /* Y1: 1 Mbps  - 160MHz / (4 * 40) = 1000000, SP = 32/40 = 80% */
+    {.bitrate = 1000000,
+     .prescaler = 4,
+     .timeSeg1 = 31,
+     .timeSeg2 = 8,
+     .sjw = 4},
+    /* Y2: 2 Mbps  - 160MHz / (2 * 40) = 2000000, SP = 32/40 = 80% */
+    {.bitrate = 2000000,
+     .prescaler = 2,
+     .timeSeg1 = 31,
+     .timeSeg2 = 8,
+     .sjw = 4},
+    /* Y3: 4 Mbps  - 160MHz / (2 * 20) = 4000000, SP = 16/20 = 80% */
+    {.bitrate = 4000000,
+     .prescaler = 2,
+     .timeSeg1 = 15,
+     .timeSeg2 = 4,
+     .sjw = 2},
+    /* Y4: 5 Mbps  - 160MHz / (2 * 16) = 5000000, SP = 13/16 = 81.25% */
+    {.bitrate = 5000000,
+     .prescaler = 2,
+     .timeSeg1 = 12,
+     .timeSeg2 = 3,
+     .sjw = 2},
+    /* Y5: 8 Mbps  - 160MHz / (2 * 10) = 8000000, SP = 8/10 = 80% */
+    {.bitrate = 8000000,
+     .prescaler = 2,
+     .timeSeg1 = 7,
+     .timeSeg2 = 2,
+     .sjw = 2},
+};
+#define FD_BITRATE_COUNT                                                       \
+  (sizeof(data_timing_table) / sizeof(data_timing_table[0]))
 
 /* 辅助函数：十六进制字符转数值（内联优化） */
 static inline uint8_t Hex2Int(char c) {
@@ -138,45 +249,6 @@ void SLCAN_FormatResponse_Fast(FDCAN_RxHeaderTypeDef *RxHeader,
   LED_WORK_TOGGLE();
 }
 
-/* 自动计算位时间 (TQ)
- * 目标采样点: 87.5% (CAN FD 推荐)
- * totalTQ = SYNC_SEG(1) + TSEG1 + TSEG2
- * 采样点 = (1 + TSEG1) / totalTQ
- */
-static CAN_Status_t Internal_CalculateTiming(uint32_t clk, uint32_t baud,
-                                             uint32_t *presc, uint32_t *s1,
-                                             uint32_t *s2, uint32_t *sjw) {
-  if (baud == 0 || clk == 0)
-    return CAN_ERR_PARAM_INVALID;
-
-  /* 遍历预分频值寻找最佳配置 */
-  for (uint32_t p = 1; p <= 512; p++) {
-    uint32_t baudXp = baud * p;
-    if (clk % baudXp != 0)
-      continue;
-
-    uint32_t totalTQ = clk / baudXp;
-    /* FDCAN 要求: TSEG1 范围 1-256, TSEG2 范围 1-128, totalTQ >= 4 */
-    if (totalTQ < 4 || totalTQ > 385)
-      continue;
-
-    /* 计算 87.5% 采样点 */
-    uint32_t tseg1 =
-        (totalTQ * 875 / 1000) - 1; /* (1 + TSEG1) / totalTQ = 0.875 */
-    uint32_t tseg2 = totalTQ - 1 - tseg1;
-
-    /* 验证范围 */
-    if (tseg1 >= 1 && tseg1 <= 256 && tseg2 >= 1 && tseg2 <= 128) {
-      *presc = p;
-      *s1 = tseg1;
-      *s2 = tseg2;
-      *sjw = (tseg2 < 16) ? tseg2 : 16; /* SJW 通常取 min(TSEG2, 16) */
-      return CAN_OK;
-    }
-  }
-  return CAN_ERR_CLOCK;
-}
-
 /* 打开 CAN 通道 */
 CAN_Status_t CanOpen(void) {
   /* 如果已经打开，先关闭 */
@@ -186,30 +258,21 @@ CAN_Status_t CanOpen(void) {
     mCfg.isOpen = 0;
   }
 
-  uint32_t p, s1, s2, sjw;
-  const uint32_t clk = HAL_RCC_GetPCLK1Freq();
-
-  /* 计算标称位时序 */
-  if (Internal_CalculateTiming(clk, mCfg.nominalBitrate, &p, &s1, &s2, &sjw) !=
-      CAN_OK) {
-    return CAN_ERR_CLOCK;
-  }
-  hfdcan1.Init.NominalPrescaler = p;
-  hfdcan1.Init.NominalTimeSeg1 = s1;
-  hfdcan1.Init.NominalTimeSeg2 = s2;
-  hfdcan1.Init.NominalSyncJumpWidth = sjw;
+  /* 使用预计算的标称位时序配置 */
+  const FDCAN_TimingConfig_t *nomTiming = &nom_timing_table[mCfg.nominalIdx];
+  hfdcan1.Init.NominalPrescaler = nomTiming->prescaler;
+  hfdcan1.Init.NominalTimeSeg1 = nomTiming->timeSeg1;
+  hfdcan1.Init.NominalTimeSeg2 = nomTiming->timeSeg2;
+  hfdcan1.Init.NominalSyncJumpWidth = nomTiming->sjw;
 
   /* FD CAN 数据位时序配置 */
   if (mCfg.isDataBitrateSet) {
-    if (Internal_CalculateTiming(clk, mCfg.dataBitrate, &p, &s1, &s2, &sjw) !=
-        CAN_OK) {
-      return CAN_ERR_CLOCK;
-    }
+    const FDCAN_TimingConfig_t *dataTiming = &data_timing_table[mCfg.dataIdx];
     hfdcan1.Init.FrameFormat = FDCAN_FRAME_FD_BRS;
-    hfdcan1.Init.DataPrescaler = p;
-    hfdcan1.Init.DataTimeSeg1 = s1;
-    hfdcan1.Init.DataTimeSeg2 = s2;
-    hfdcan1.Init.DataSyncJumpWidth = sjw;
+    hfdcan1.Init.DataPrescaler = dataTiming->prescaler;
+    hfdcan1.Init.DataTimeSeg1 = dataTiming->timeSeg1;
+    hfdcan1.Init.DataTimeSeg2 = dataTiming->timeSeg2;
+    hfdcan1.Init.DataSyncJumpWidth = dataTiming->sjw;
   } else {
     hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
   }
@@ -248,16 +311,6 @@ void CanClose(void) {
   LED_STATE_OFF();
 }
 
-/* 标准波特率表 (SLCAN S0-S8) */
-static const uint32_t std_bitrates[] = {10000,  20000,  50000,  100000, 125000,
-                                        250000, 500000, 800000, 1000000};
-#define STD_BITRATE_COUNT (sizeof(std_bitrates) / sizeof(std_bitrates[0]))
-
-/* FD 数据波特率表 (Y1-Y5) */
-static const uint32_t fd_bitrates[] = {1000000, 2000000, 3000000, 4000000,
-                                       5000000};
-#define FD_BITRATE_COUNT (sizeof(fd_bitrates) / sizeof(fd_bitrates[0]))
-
 /* 处理 USB 发来的 SLCAN 指令 */
 CAN_Status_t SLCAN_ProcessCommand(char *cmd, char *response) {
   if (cmd == NULL || response == NULL || cmd[0] == '\0') {
@@ -274,18 +327,18 @@ CAN_Status_t SLCAN_ProcessCommand(char *cmd, char *response) {
     const uint8_t idx = cmd[1] - '0';
     if (idx >= STD_BITRATE_COUNT)
       return CAN_ERR_PARAM_INVALID;
-    mCfg.nominalBitrate = std_bitrates[idx];
+    mCfg.nominalIdx = idx;
     return CAN_OK;
   }
 
-  /* 设置 FD 数据波特率 Y0-Y4 */
+  /* 设置 FD 数据波特率 Y1-Y5 */
   case 'Y': {
     if (mCfg.isOpen)
       return CAN_ERR_PARAM_INVALID;
     const uint8_t idx = cmd[1] - '1';
     if (idx >= FD_BITRATE_COUNT)
       return CAN_ERR_PARAM_INVALID;
-    mCfg.dataBitrate = fd_bitrates[idx];
+    mCfg.dataIdx = idx;
     mCfg.isDataBitrateSet = 1;
     return CAN_OK;
   }
@@ -299,10 +352,26 @@ CAN_Status_t SLCAN_ProcessCommand(char *cmd, char *response) {
     CanClose();
     return CAN_OK;
 
-  /* 查询版本 */
-  case 'V':
-    strcpy(response, "V1111\r");
+  /* 查询版本 + MCU UID */
+  case 'V': {
+    char *p = response;
+    *p++ = 'V';
+    /* 版本号 */
+    const char ver[] = "1111";
+    for (const char *v = ver; *v;)
+      *p++ = *v++;
+    /* 追加 96-bit MCU Unique ID (24 hex chars) */
+    const uint32_t uid[3] = {*(volatile uint32_t *)(UID_BASE),
+                             *(volatile uint32_t *)(UID_BASE + 4U),
+                             *(volatile uint32_t *)(UID_BASE + 8U)};
+    for (int i = 0; i < 3; i++) {
+      for (int s = 28; s >= 0; s -= 4)
+        *p++ = hex_table[(uid[i] >> s) & 0x0F];
+    }
+    *p++ = '\r';
+    *p = '\0';
     return CAN_OK;
+  }
 
   /* 查询序列号 */
   case 'N':
@@ -355,7 +424,8 @@ CAN_Status_t SLCAN_ProcessCommand(char *cmd, char *response) {
       return CAN_ERR_PARAM_INVALID;
 
     /* 解析数据长度 */
-    uint8_t len = Hex2Int(*ptr++);
+    uint8_t dlc = Hex2Int(*ptr++);
+    uint8_t len = dlc2len[dlc];
     if (len > 64)
       return CAN_ERR_PARAM_INVALID;
     if (!isFdc)
@@ -364,10 +434,7 @@ CAN_Status_t SLCAN_ProcessCommand(char *cmd, char *response) {
     /* 解析数据 */
     uint8_t txData[64] = {0};
     if (!isRtr) {
-      const size_t expectedLen = 1 + idLen + 1 + len * 2;
-      if (cmdLen < expectedLen)
-        return CAN_ERR_PARAM_INVALID;
-      for (uint8_t i = 0; i < len; i++) {
+      for (uint8_t i = 0; i < len && ptr[0] != '\0'; i++) {
         txData[i] = (Hex2Int(ptr[0]) << 4) | Hex2Int(ptr[1]);
         ptr += 2;
       }
@@ -426,7 +493,13 @@ void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan,
     HAL_FDCAN_GetProtocolStatus(hfdcan, &protStatus);
 
     if (protStatus.BusOff == 1) {
-      CLEAR_BIT(hfdcan->Instance->CCCR, FDCAN_CCCR_INIT);
+      /* 离线后尝试恢复：先进入INIT，延时，重新初始化并打开通道 */
+      SET_BIT(hfdcan->Instance->CCCR, FDCAN_CCCR_INIT);
+      for (volatile uint32_t i = 0; i < 800000; ++i) {
+        __NOP();
+      } // 简单延时约10ms@160MHz
+      HAL_FDCAN_DeInit(hfdcan);
+      CanOpen();
     }
     USB_TxBuf_WriteString("E\r"); /* 发送总线错误状态 */
   }
