@@ -12,7 +12,10 @@ extern volatile uint8_t usb_tx_busy;
 /**
  * @brief USB TX 数据泵，处理 CAN->USB 数据传输
  * @note  从环形缓冲区读取数据并通过 USB CDC 发送
- *        使用原子操作保证多线程安全
+ *        SPSC 无锁设计：只修改 tail，读取 volatile head
+ *        usb_tx_busy 标志防止重入，确保 pkt 缓冲区不被覆盖
+ *        tail 在此处更新是安全的（CDC_Transmit_FS 成功后，usb_tx_busy
+ *        保护确保下次调用前数据已发送完成）
  */
 void Process_USB_TX_Pump(void) {
   /* 检查 USB 发送状态 */
@@ -53,7 +56,7 @@ void Process_USB_TX_Pump(void) {
   if (CDC_Transmit_FS(pkt, (uint16_t)len) != USBD_OK) {
     usb_tx_busy = 0; /* 发送失败，重置标志 */
   } else {
-    /* 更新尾指针 */
+    /* 更新尾指针（usb_tx_busy 保护确保安全） */
     g_usb_tx_fifo.tail = (tail + len) % TX_BUF_SIZE;
   }
 }

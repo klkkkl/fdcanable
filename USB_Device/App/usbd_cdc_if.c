@@ -352,6 +352,7 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
   UNUSED(Buf);
   UNUSED(Len);
   UNUSED(epnum);
+  __DMB(); /* 数据内存屏障，确保 USB 传输完成的副作用对主循环可见 */
   usb_tx_busy = 0;
   /* USER CODE END 13 */
   return result;

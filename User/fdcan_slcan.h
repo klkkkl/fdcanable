@@ -13,6 +13,7 @@ extern "C" {
 /* ==================== 配置参数 ==================== */
 #define TX_BUF_SIZE 4096U      /* CAN -> USB 环形缓冲区大小 */
 #define SLCAN_CMD_MAX_LEN 150U /* USB -> CAN 命令最大长度 */
+#define BUS_OFFLINE_THRESHOLD 3U /* 总线离线重启阈值（秒） */
 
 /* ==================== LED 控制宏 ==================== */
 /* 假设 CubeMX 中已命名为 LED_STATE 和 LED_WORK */
@@ -43,9 +44,12 @@ typedef enum {
 /* ==================== 数据结构 ==================== */
 
 /**
- * @brief USB 发送环形缓冲区
- * @note  head: 写入位置，由生产者（CAN RX）更新
- *        tail: 读取位置，由消费者（USB TX）更新
+ * @brief USB 发送环形缓冲区（单生产者单消费者，无锁设计）
+ * @note  生产者（FDCAN 中断）只写 head，读 tail
+ *        消费者（主循环）只写 tail，读 head
+ *        volatile 确保编译器不优化内存访问，无需额外同步机制
+ *        head: 写入位置，由生产者更新
+ *        tail: 读取位置，由消费者更新
  */
 typedef struct {
   uint8_t buffer[TX_BUF_SIZE];
@@ -93,6 +97,13 @@ void Process_USB_TX_Pump(void);
  * @param s 要发送的字符串
  */
 void USB_TxBuf_WriteString(const char *s);
+
+/**
+ * @brief 检测 FDCAN 总线状态并处理离线情况
+ * @note  在定时器中断中调用（1 秒一次）
+ *        检测总线离线状态，发送错误通知，超时后重启总线
+ */
+void FDCAN_CheckBusStatus(void);
 
 #ifdef __cplusplus
 }

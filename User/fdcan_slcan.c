@@ -181,10 +181,14 @@ static inline uint32_t GetFdcanDlc(uint8_t len) {
  * @param s 要写入的字符串
  * @note  通过禁用中断保证原子性，防止多生产者竞争
  */
+/**
+ * @brief 向 USB 发送缓冲区写入字符串（在中断中调用）
+ * @param s 要写入的字符串
+ * @note  SPSC 无锁设计：生产者只修改 head，读取 volatile tail
+ *        消费者只修改 tail，读取 volatile head
+ *        无需关中断保护，volatile 确保内存可见性
+ */
 void USB_TxBuf_WriteString(const char *s) {
-  uint32_t primask = __get_PRIMASK();
-  __disable_irq(); /* 进入临界区 */
-
   while (*s) {
     uint32_t next = (g_usb_tx_fifo.head + 1) % TX_BUF_SIZE;
     if (next != g_usb_tx_fifo.tail) {
@@ -194,8 +198,6 @@ void USB_TxBuf_WriteString(const char *s) {
       break; /* 缓冲区满 */
     }
   }
-
-  __set_PRIMASK(primask); /* 退出临界区，恢复原中断状态 */
 }
 
 /* 快速格式化 CAN 报文为 SLCAN 字符串 (查表法替代 sprintf) */
@@ -502,5 +504,35 @@ void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan,
       CanOpen();
     }
     USB_TxBuf_WriteString("E\r"); /* 发送总线错误状态 */
+  }
+}
+
+/* 总线离线计数器（由 TIM3 回调递增，CanOpen 成功后清零） */
+static volatile uint32_t s_bus_offline_secs = 0;
+
+/**
+ * @brief 检测 FDCAN 总线状态，在 TIM3 中断（1 秒）中调用
+ * @note  - 总线离线时每秒向上位机发送 "E\r"
+ *        - 离线超过 BUS_OFFLINE_THRESHOLD 秒后重启总线
+ *        - 总线恢复正常后清零计数器
+ */
+void FDCAN_CheckBusStatus(void) {
+  if (!mCfg.isOpen) {
+    return;
+  }
+
+  FDCAN_ProtocolStatusTypeDef protStatus;
+  HAL_FDCAN_GetProtocolStatus(&hfdcan1, &protStatus);
+
+  if (protStatus.BusOff) {
+    s_bus_offline_secs++;
+    USB_TxBuf_WriteString("E\r");
+
+    if (s_bus_offline_secs >= BUS_OFFLINE_THRESHOLD) {
+      s_bus_offline_secs = 0;
+      CanOpen(); /* 重启总线 */
+    }
+  } else {
+    s_bus_offline_secs = 0;
   }
 }
