@@ -5,6 +5,14 @@ extern FDCAN_HandleTypeDef hfdcan1;
 USB_TxBuffer_t g_usb_tx_fifo = {0};
 extern volatile uint8_t usb_tx_busy;
 
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+#define SLCAN_MAX_DATA_BYTES 64U
+#define SLCAN_STD_ID_HEX_LEN 3U
+#define SLCAN_EXT_ID_HEX_LEN 8U
+#define SLCAN_FRAME_TEXT_MAX_LEN 150U
+#define SLCAN_UID_WORD_COUNT 3U
+#define BUS_OFF_RECOVERY_DELAY_MS 10U
+
 static const char hex_table[] = "0123456789ABCDEF";
 
 /* DLC 值到实际字节数的映射 (FDCAN DataLength >> 16 作为索引) */
@@ -37,8 +45,8 @@ static const uint32_t len2dlc[] = {
     FDCAN_DLC_BYTES_64, FDCAN_DLC_BYTES_64};
 
 typedef struct {
-  uint8_t nominalIdx; /* 标称波特率索引 (0-8) */
-  uint8_t dataIdx;    /* 数据波特率索引 (0-4) */
+  uint8_t nominalIdx; /* 标称波特率配置索引 */
+  uint8_t dataIdx;    /* 数据波特率配置索引 */
   uint8_t isDataBitrateSet;
   uint8_t isOpen;
 } FDCAN_Config_t;
@@ -47,6 +55,14 @@ static FDCAN_Config_t mCfg = {.nominalIdx = 6, /* 默认 S6: 500 kbps */
                               .dataIdx = 1,    /* 默认 Y2: 2 Mbps */
                               .isDataBitrateSet = 1,
                               .isOpen = 0};
+
+typedef struct {
+  uint8_t idLen;
+  uint8_t isExt;
+  uint8_t isRtr;
+  uint8_t isFdc;
+  uint8_t isBrs;
+} SLCAN_FrameFormat_t;
 
 /**
  * 预计算的 FDCAN 位时序配置
@@ -63,7 +79,7 @@ typedef struct {
   uint8_t sjw;        /* 同步跳转宽度 1-128 */
 } FDCAN_TimingConfig_t;
 
-/* 标称波特率时序配置表 (SLCAN S0-S8) - 160 MHz, 80% 采样点 */
+/* 标称波特率时序配置表 (SLCAN S0-S8, S10) - 160 MHz, 80% 采样点 */
 static const FDCAN_TimingConfig_t nom_timing_table[] = {
     /* S0: 10 kbps   - 160MHz / (100 * 160) = 10000, SP = 128/160 = 80% */
     {.bitrate = 10000,
@@ -119,11 +135,16 @@ static const FDCAN_TimingConfig_t nom_timing_table[] = {
      .timeSeg1 = 63,
      .timeSeg2 = 16,
      .sjw = 16},
+    /* S10: 2000 kbps - 160MHz / (2 * 40) = 2000000, SP = 32/40 = 80% */
+    {.bitrate = 2000000,
+     .prescaler = 2,
+     .timeSeg1 = 31,
+     .timeSeg2 = 8,
+     .sjw = 4},
 };
-#define STD_BITRATE_COUNT                                                      \
-  (sizeof(nom_timing_table) / sizeof(nom_timing_table[0]))
+static const uint8_t nom_timing_cmd_values[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 10};
 
-/* FD 数据波特率时序配置表 (Y1-Y5) - 160 MHz, 80% 采样点 */
+/* FD 数据波特率时序配置表 (Y1-Y5, Y8) - 160 MHz, 80% 采样点 */
 static const FDCAN_TimingConfig_t data_timing_table[] = {
     /* Y1: 1 Mbps  - 160MHz / (4 * 40) = 1000000, SP = 32/40 = 80% */
     {.bitrate = 1000000,
@@ -155,25 +176,335 @@ static const FDCAN_TimingConfig_t data_timing_table[] = {
      .timeSeg1 = 7,
      .timeSeg2 = 2,
      .sjw = 2},
+    /* Y8: 8 Mbps  - 与 Y5 共用 8Mbps 时序，提供协议别名 */
+    {.bitrate = 8000000,
+     .prescaler = 2,
+     .timeSeg1 = 7,
+     .timeSeg2 = 2,
+     .sjw = 2},
 };
-#define FD_BITRATE_COUNT                                                       \
-  (sizeof(data_timing_table) / sizeof(data_timing_table[0]))
+static const uint8_t data_timing_cmd_values[] = {1, 2, 3, 4, 5, 8};
 
-/* 辅助函数：十六进制字符转数值（内联优化） */
-static inline uint8_t Hex2Int(char c) {
-  /* 利用 ASCII 特性进行快速转换 */
-  if ((uint8_t)(c - '0') <= 9u)
-    return c - '0';
-  if ((uint8_t)(c - 'A') <= 5u)
-    return c - 'A' + 10;
-  if ((uint8_t)(c - 'a') <= 5u)
-    return c - 'a' + 10;
+/* Bus-Off 恢复状态 */
+static volatile uint8_t s_busoff_recovery_pending = 0;
+static volatile uint32_t s_busoff_recovery_deadline = 0;
+static volatile uint32_t s_bus_offline_secs = 0;
+
+static uint32_t USB_TxBuf_Write(const char *data, uint32_t len);
+
+static uint8_t ParseHexDigit(char c, uint8_t *value) {
+  if ((uint8_t)(c - '0') <= 9u) {
+    *value = (uint8_t)(c - '0');
+    return 1;
+  }
+
+  if ((uint8_t)(c - 'A') <= 5u) {
+    *value = (uint8_t)(c - 'A' + 10);
+    return 1;
+  }
+
+  if ((uint8_t)(c - 'a') <= 5u) {
+    *value = (uint8_t)(c - 'a' + 10);
+    return 1;
+  }
+
   return 0;
+}
+
+static uint8_t ParseHexField(const char *src, uint8_t digits, uint32_t *value) {
+  uint32_t parsed = 0;
+
+  for (uint8_t i = 0; i < digits; ++i) {
+    uint8_t nibble;
+    if (!ParseHexDigit(src[i], &nibble)) {
+      return 0;
+    }
+    parsed = (parsed << 4) | nibble;
+  }
+
+  *value = parsed;
+  return 1;
+}
+
+static uint8_t ParseHexBytes(const char *src, uint8_t len, uint8_t *data) {
+  for (uint8_t i = 0; i < len; ++i) {
+    uint8_t hi;
+    uint8_t lo;
+
+    if (!ParseHexDigit(src[0], &hi) || !ParseHexDigit(src[1], &lo)) {
+      return 0;
+    }
+
+    data[i] = (uint8_t)((hi << 4) | lo);
+    src += 2;
+  }
+
+  return 1;
+}
+
+static uint8_t ParseDecimalUint8(const char *src, uint8_t *value) {
+  uint16_t parsed = 0;
+
+  if (src[0] == '\0') {
+    return 0;
+  }
+
+  for (const char *p = src; *p != '\0'; ++p) {
+    if (*p < '0' || *p > '9') {
+      return 0;
+    }
+
+    parsed = (uint16_t)(parsed * 10U + (uint16_t)(*p - '0'));
+    if (parsed > UINT8_MAX) {
+      return 0;
+    }
+  }
+
+  *value = (uint8_t)parsed;
+  return 1;
 }
 
 /* 获取正确的 FDCAN DataLength 值 */
 static inline uint32_t GetFdcanDlc(uint8_t len) {
-  return (len <= 64) ? len2dlc[len] : FDCAN_DLC_BYTES_64;
+  return (len <= SLCAN_MAX_DATA_BYTES) ? len2dlc[len] : FDCAN_DLC_BYTES_64;
+}
+
+static inline uint8_t GetPayloadLengthFromDlc(uint8_t dlc) {
+  return (dlc < ARRAY_SIZE(dlc2len)) ? dlc2len[dlc] : 0U;
+}
+
+static int8_t FindTimingIndexByCommand(const uint8_t *cmd_values,
+                                       uint8_t count, uint8_t cmd_value) {
+  for (uint8_t i = 0; i < count; ++i) {
+    if (cmd_values[i] == cmd_value) {
+      return (int8_t)i;
+    }
+  }
+
+  return -1;
+}
+
+static uint8_t SLCAN_GetFrameFormat(char type, SLCAN_FrameFormat_t *format) {
+  switch (type) {
+  case 't':
+    *format = (SLCAN_FrameFormat_t){.idLen = SLCAN_STD_ID_HEX_LEN};
+    return 1;
+  case 'T':
+    *format = (SLCAN_FrameFormat_t){.idLen = SLCAN_EXT_ID_HEX_LEN,
+                                    .isExt = 1};
+    return 1;
+  case 'r':
+    *format = (SLCAN_FrameFormat_t){.idLen = SLCAN_STD_ID_HEX_LEN,
+                                    .isRtr = 1};
+    return 1;
+  case 'R':
+    *format = (SLCAN_FrameFormat_t){.idLen = SLCAN_EXT_ID_HEX_LEN,
+                                    .isExt = 1,
+                                    .isRtr = 1};
+    return 1;
+  case 'd':
+    *format = (SLCAN_FrameFormat_t){.idLen = SLCAN_STD_ID_HEX_LEN,
+                                    .isFdc = 1};
+    return 1;
+  case 'D':
+    *format = (SLCAN_FrameFormat_t){.idLen = SLCAN_EXT_ID_HEX_LEN,
+                                    .isExt = 1,
+                                    .isFdc = 1};
+    return 1;
+  case 'b':
+    *format = (SLCAN_FrameFormat_t){.idLen = SLCAN_STD_ID_HEX_LEN,
+                                    .isFdc = 1,
+                                    .isBrs = 1};
+    return 1;
+  case 'B':
+    *format = (SLCAN_FrameFormat_t){.idLen = SLCAN_EXT_ID_HEX_LEN,
+                                    .isExt = 1,
+                                    .isFdc = 1,
+                                    .isBrs = 1};
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static void ResetBusRecoveryState(void) {
+  s_busoff_recovery_pending = 0;
+  s_busoff_recovery_deadline = 0;
+  s_bus_offline_secs = 0;
+}
+
+static void StopCanController(void) {
+  if (hfdcan1.State != HAL_FDCAN_STATE_RESET) {
+    HAL_FDCAN_Stop(&hfdcan1);
+    HAL_FDCAN_DeInit(&hfdcan1);
+  }
+
+  mCfg.isOpen = 0;
+}
+
+static void AppendUid(char **response) {
+  const uint32_t uid[SLCAN_UID_WORD_COUNT] = {
+      *(volatile uint32_t *)(UID_BASE),
+      *(volatile uint32_t *)(UID_BASE + 4U),
+      *(volatile uint32_t *)(UID_BASE + 8U),
+  };
+
+  for (uint8_t i = 0; i < SLCAN_UID_WORD_COUNT; ++i) {
+    for (int shift = 28; shift >= 0; shift -= 4) {
+      *(*response)++ = hex_table[(uid[i] >> shift) & 0x0F];
+    }
+  }
+}
+
+static void BuildVersionResponse(char *response) {
+  char *p = response;
+  *p++ = 'V';
+
+  for (const char *v = SLCAN_FW_VERSION; *v != '\0'; ++v) {
+    *p++ = *v;
+  }
+
+  AppendUid(&p);
+  *p++ = '\r';
+  *p = '\0';
+}
+
+static void BuildSerialResponse(char *response) {
+  char *p = response;
+  *p++ = 'N';
+
+  for (const char *serial = SLCAN_SERIAL_NAME; *serial != '\0'; ++serial) {
+    *p++ = *serial;
+  }
+
+  *p++ = '\r';
+  *p = '\0';
+}
+
+static void WriteBusErrorNotification(void) {
+  (void)USB_TxBuf_Write("E\r", 2U);
+}
+
+static uint8_t HasNoTrailingArgs(const char *cmd) {
+  return (cmd[1] == '\0');
+}
+
+static CAN_Status_t HandleStandardBitrateCommand(const char *cmd) {
+  uint8_t cmd_value;
+  int8_t idx;
+
+  if (mCfg.isOpen) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  if (!ParseDecimalUint8(&cmd[1], &cmd_value)) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  idx = FindTimingIndexByCommand(nom_timing_cmd_values,
+                                 ARRAY_SIZE(nom_timing_cmd_values), cmd_value);
+  if (idx < 0) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  mCfg.nominalIdx = (uint8_t)idx;
+  return CAN_OK;
+}
+
+static CAN_Status_t HandleDataBitrateCommand(const char *cmd) {
+  uint8_t cmd_value;
+  int8_t idx;
+
+  if (mCfg.isOpen) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  if (!ParseDecimalUint8(&cmd[1], &cmd_value)) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  idx = FindTimingIndexByCommand(data_timing_cmd_values,
+                                 ARRAY_SIZE(data_timing_cmd_values), cmd_value);
+  if (idx < 0) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  mCfg.dataIdx = (uint8_t)idx;
+  mCfg.isDataBitrateSet = 1;
+  return CAN_OK;
+}
+
+static CAN_Status_t HandleTxCommand(const char *cmd, char type) {
+  SLCAN_FrameFormat_t format;
+  FDCAN_TxHeaderTypeDef tx_header = {0};
+  uint8_t tx_data[SLCAN_MAX_DATA_BYTES] = {0};
+  uint32_t id;
+  uint8_t dlc;
+  uint8_t len;
+  const size_t cmd_len = strlen(cmd);
+  size_t expected_len;
+
+  if (!mCfg.isOpen) {
+    return CAN_ERR_HAL_START;
+  }
+
+  if (!SLCAN_GetFrameFormat(type, &format)) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  expected_len = (size_t)(1U + format.idLen + 1U);
+  if (cmd_len < expected_len) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  if (!ParseHexField(&cmd[1], format.idLen, &id)) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  if ((format.isExt && id > 0x1FFFFFFFU) || (!format.isExt && id > 0x7FFU)) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  if (!ParseHexDigit(cmd[1 + format.idLen], &dlc)) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  if (!format.isFdc && dlc > 8U) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  len = GetPayloadLengthFromDlc(dlc);
+  if (len > SLCAN_MAX_DATA_BYTES) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  expected_len += format.isRtr ? 0U : (size_t)len * 2U;
+  if (cmd_len != expected_len) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  if (!format.isRtr &&
+      !ParseHexBytes(&cmd[1 + format.idLen + 1], len, tx_data)) {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  tx_header.Identifier = id;
+  tx_header.IdType = format.isExt ? FDCAN_EXTENDED_ID : FDCAN_STANDARD_ID;
+  tx_header.TxFrameType =
+      format.isRtr ? FDCAN_REMOTE_FRAME : FDCAN_DATA_FRAME;
+  tx_header.DataLength = GetFdcanDlc(len);
+  tx_header.FDFormat = format.isFdc ? FDCAN_FD_CAN : FDCAN_CLASSIC_CAN;
+  tx_header.BitRateSwitch = format.isBrs ? FDCAN_BRS_ON : FDCAN_BRS_OFF;
+  tx_header.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  tx_header.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+  tx_header.MessageMarker = 0;
+
+  if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &tx_header, tx_data) != HAL_OK) {
+    return CAN_ERR_HAL_INIT;
+  }
+
+  LED_WORK_TOGGLE();
+  return CAN_OK;
 }
 
 /**
@@ -221,11 +552,13 @@ void USB_TxBuf_WriteString(const char *s) {
 /* 快速格式化 CAN 报文为 SLCAN 字符串 (查表法替代 sprintf) */
 void SLCAN_FormatResponse_Fast(FDCAN_RxHeaderTypeDef *RxHeader,
                                uint8_t *RxData) {
-  char msg[150], *p = msg;
+  char msg[SLCAN_FRAME_TEXT_MAX_LEN];
+  char *p = msg;
   const uint8_t isExt = (RxHeader->IdType == FDCAN_EXTENDED_ID);
   const uint8_t isRtr = (RxHeader->RxFrameType == FDCAN_REMOTE_FRAME);
   const uint8_t isBrs = (RxHeader->BitRateSwitch == FDCAN_BRS_ON);
   const uint8_t isFdc = (RxHeader->FDFormat == FDCAN_FD_CAN);
+  const uint8_t dlc = (uint8_t)RxHeader->DataLength;
 
   /* 帧类型标识符 */
   if (isFdc) {
@@ -249,11 +582,10 @@ void SLCAN_FormatResponse_Fast(FDCAN_RxHeaderTypeDef *RxHeader,
   p += idLen;
 
   /* 数据长度 */
-  const uint8_t len = dlc2len[RxHeader->DataLength];
+  const uint8_t len = GetPayloadLengthFromDlc(dlc);
 
-  /* FD CAN 长度可能超过 9，使用两位十六进制 */
-
-  *p++ = hex_table[RxHeader->DataLength];
+  /* DLC 使用单个十六进制字符编码 */
+  *p++ = hex_table[dlc];
 
   /* 数据字段 */
   if (!isRtr) {
@@ -270,12 +602,7 @@ void SLCAN_FormatResponse_Fast(FDCAN_RxHeaderTypeDef *RxHeader,
 
 /* 打开 CAN 通道 */
 CAN_Status_t CanOpen(void) {
-  /* 如果已经打开，先关闭 */
-  if (mCfg.isOpen || hfdcan1.State != HAL_FDCAN_STATE_RESET) {
-    HAL_FDCAN_Stop(&hfdcan1);
-    HAL_FDCAN_DeInit(&hfdcan1);
-    mCfg.isOpen = 0;
-  }
+  StopCanController();
 
   /* 使用预计算的标称位时序配置 */
   const FDCAN_TimingConfig_t *nomTiming = &nom_timing_table[mCfg.nominalIdx];
@@ -298,35 +625,44 @@ CAN_Status_t CanOpen(void) {
 
   /* 配置全局过滤器：接收所有帧 */
   if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) {
+    LED_STATE_OFF();
     return CAN_ERR_HAL_INIT;
   }
 
   /* 配置过滤器：接收所有标准帧和扩展帧 */
-  HAL_FDCAN_ConfigGlobalFilter(&hfdcan1,
-                               FDCAN_ACCEPT_IN_RX_FIFO0, /* 非匹配标准帧 */
-                               FDCAN_ACCEPT_IN_RX_FIFO0, /* 非匹配扩展帧 */
-                               FDCAN_FILTER_REMOTE,      /* 远程标准帧 */
-                               FDCAN_FILTER_REMOTE);     /* 远程扩展帧 */
+  if (HAL_FDCAN_ConfigGlobalFilter(
+          &hfdcan1,
+          FDCAN_ACCEPT_IN_RX_FIFO0, /* 非匹配标准帧 */
+          FDCAN_ACCEPT_IN_RX_FIFO0, /* 非匹配扩展帧 */
+          FDCAN_FILTER_REMOTE,      /* 远程标准帧 */
+          FDCAN_FILTER_REMOTE) != HAL_OK) {
+    LED_STATE_OFF();
+    return CAN_ERR_HAL_INIT;
+  }
 
   if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) {
+    LED_STATE_OFF();
     return CAN_ERR_HAL_START;
   }
 
   /* 启用接收中断 */
-  HAL_FDCAN_ActivateNotification(
-      &hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_BUS_OFF, 0);
+  if (HAL_FDCAN_ActivateNotification(
+          &hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_BUS_OFF, 0) !=
+      HAL_OK) {
+    LED_STATE_OFF();
+    return CAN_ERR_HAL_START;
+  }
 
   mCfg.isOpen = 1;
+  ResetBusRecoveryState();
   LED_STATE_ON();
   return CAN_OK;
 }
 
 /* 关闭 CAN 通道 */
 void CanClose(void) {
-  if (mCfg.isOpen) {
-    HAL_FDCAN_Stop(&hfdcan1);
-    mCfg.isOpen = 0;
-  }
+  StopCanController();
+  ResetBusRecoveryState();
   LED_STATE_OFF();
 }
 
@@ -340,65 +676,49 @@ CAN_Status_t SLCAN_ProcessCommand(char *cmd, char *response) {
 
   switch (type) {
   /* 设置标准波特率 S0-S8 */
-  case 'S': {
-    if (mCfg.isOpen)
-      return CAN_ERR_PARAM_INVALID; /* 通道打开时不允许更改 */
-    const uint8_t idx = cmd[1] - '0';
-    if (idx >= STD_BITRATE_COUNT)
-      return CAN_ERR_PARAM_INVALID;
-    mCfg.nominalIdx = idx;
-    return CAN_OK;
-  }
+  case 'S':
+    return HandleStandardBitrateCommand(cmd);
 
   /* 设置 FD 数据波特率 Y1-Y5 */
-  case 'Y': {
-    if (mCfg.isOpen)
-      return CAN_ERR_PARAM_INVALID;
-    const uint8_t idx = cmd[1] - '1';
-    if (idx >= FD_BITRATE_COUNT)
-      return CAN_ERR_PARAM_INVALID;
-    mCfg.dataIdx = idx;
-    mCfg.isDataBitrateSet = 1;
-    return CAN_OK;
-  }
+  case 'Y':
+    return HandleDataBitrateCommand(cmd);
 
   /* 打开 CAN 通道 */
   case 'O':
+    if (!HasNoTrailingArgs(cmd)) {
+      return CAN_ERR_PARAM_INVALID;
+    }
     return CanOpen();
 
   /* 关闭 CAN 通道 */
   case 'C':
+    if (!HasNoTrailingArgs(cmd)) {
+      return CAN_ERR_PARAM_INVALID;
+    }
     CanClose();
     return CAN_OK;
 
   /* 查询版本 + MCU UID */
-  case 'V': {
-    char *p = response;
-    *p++ = 'V';
-    /* 版本号 */
-    const char ver[] = SLCAN_FW_VERSION;
-    for (const char *v = ver; *v;)
-      *p++ = *v++;
-    /* 追加 96-bit MCU Unique ID (24 hex chars) */
-    const uint32_t uid[3] = {*(volatile uint32_t *)(UID_BASE),
-                             *(volatile uint32_t *)(UID_BASE + 4U),
-                             *(volatile uint32_t *)(UID_BASE + 8U)};
-    for (int i = 0; i < 3; i++) {
-      for (int s = 28; s >= 0; s -= 4)
-        *p++ = hex_table[(uid[i] >> s) & 0x0F];
+  case 'V':
+    if (!HasNoTrailingArgs(cmd)) {
+      return CAN_ERR_PARAM_INVALID;
     }
-    *p++ = '\r';
-    *p = '\0';
+    BuildVersionResponse(response);
     return CAN_OK;
-  }
 
   /* 查询序列号 */
   case 'N':
-    strcpy(response, "N" SLCAN_SERIAL_NAME);
+    if (!HasNoTrailingArgs(cmd)) {
+      return CAN_ERR_PARAM_INVALID;
+    }
+    BuildSerialResponse(response);
     return CAN_OK;
 
   /* 查询状态标志 */
   case 'F':
+    if (!HasNoTrailingArgs(cmd)) {
+      return CAN_ERR_PARAM_INVALID;
+    }
     strcpy(response, "F00\r");
     return CAN_OK;
 
@@ -410,73 +730,8 @@ CAN_Status_t SLCAN_ProcessCommand(char *cmd, char *response) {
   case 'b':
   case 'B':
   case 'r':
-  case 'R': {
-    if (!mCfg.isOpen)
-      return CAN_ERR_HAL_START; /* 通道未打开 */
-
-    FDCAN_TxHeaderTypeDef th = {0};
-    const uint8_t isExt =
-        (type == 'T' || type == 'D' || type == 'R' || type == 'B');
-    const uint8_t isRtr = (type == 'r' || type == 'R');
-    const uint8_t isFdc =
-        (type == 'D' || type == 'd' || type == 'B' || type == 'b');
-    const uint8_t isBrs = (type == 'B' || type == 'b');
-
-    const int idLen = isExt ? 8 : 3;
-
-    /* 检查命令长度 */
-    const size_t cmdLen = strlen(cmd);
-    if (cmdLen < (size_t)(1 + idLen + 1))
-      return CAN_ERR_PARAM_INVALID;
-
-    /* 解析 ID */
-    uint32_t id = 0;
-    const char *ptr = &cmd[1];
-    for (int i = 0; i < idLen; i++) {
-      id = (id << 4) | Hex2Int(*ptr++);
-    }
-
-    /* 验证 ID 范围 */
-    if (isExt && id > 0x1FFFFFFF)
-      return CAN_ERR_PARAM_INVALID;
-    if (!isExt && id > 0x7FF)
-      return CAN_ERR_PARAM_INVALID;
-
-    /* 解析数据长度 */
-    uint8_t dlc = Hex2Int(*ptr++);
-    uint8_t len = dlc2len[dlc];
-    if (len > 64)
-      return CAN_ERR_PARAM_INVALID;
-    if (!isFdc)
-      len = MIN(len, 8); /* Classic CAN 最大 8 字节 */
-
-    /* 解析数据 */
-    uint8_t txData[64] = {0};
-    if (!isRtr) {
-      for (uint8_t i = 0; i < len && ptr[0] != '\0'; i++) {
-        txData[i] = (Hex2Int(ptr[0]) << 4) | Hex2Int(ptr[1]);
-        ptr += 2;
-      }
-    }
-
-    /* 配置发送头 */
-    th.Identifier = id;
-    th.IdType = isExt ? FDCAN_EXTENDED_ID : FDCAN_STANDARD_ID;
-    th.TxFrameType = isRtr ? FDCAN_REMOTE_FRAME : FDCAN_DATA_FRAME;
-    th.DataLength = GetFdcanDlc(len);
-    th.FDFormat = isFdc ? FDCAN_FD_CAN : FDCAN_CLASSIC_CAN;
-    th.BitRateSwitch = isBrs ? FDCAN_BRS_ON : FDCAN_BRS_OFF;
-    th.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    th.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-    th.MessageMarker = 0;
-
-    /* 发送 */
-    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &th, txData) == HAL_OK) {
-      LED_WORK_TOGGLE();
-      return CAN_OK;
-    }
-    return CAN_ERR_HAL_INIT;
-  }
+  case 'R':
+    return HandleTxCommand(cmd, type);
 
   default:
     break;
@@ -504,9 +759,6 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
   }
 }
 
-/* Bus-Off 恢复标志（ISR 设置，主循环轮询处理） */
-static volatile uint8_t s_busoff_recovery_pending = 0;
-
 void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan,
                                    uint32_t ErrorStatusITs) {
   FDCAN_ProtocolStatusTypeDef protStatus;
@@ -518,13 +770,11 @@ void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan,
       /* 立即进入 INIT 模式停止控制器，延迟恢复交给主循环 */
       SET_BIT(hfdcan->Instance->CCCR, FDCAN_CCCR_INIT);
       s_busoff_recovery_pending = 1;
+      s_busoff_recovery_deadline = 0;
     }
-    USB_TxBuf_WriteString("E\r"); /* 发送总线错误状态 */
+    WriteBusErrorNotification();
   }
 }
-
-/* 总线离线计数器（由 TIM3 回调递增，CanOpen 成功后清零） */
-static volatile uint32_t s_bus_offline_secs = 0;
 
 /**
  * @brief 检测 FDCAN 总线状态，在 TIM3 中断（1 秒）中调用
@@ -542,7 +792,7 @@ void FDCAN_CheckBusStatus(void) {
 
   if (protStatus.BusOff) {
     s_bus_offline_secs++;
-    USB_TxBuf_WriteString("E\r");
+    WriteBusErrorNotification();
 
     if (s_bus_offline_secs >= BUS_OFFLINE_THRESHOLD) {
       s_bus_offline_secs = 0;
@@ -555,15 +805,25 @@ void FDCAN_CheckBusStatus(void) {
 
 /**
  * @brief Bus-Off 延迟恢复，在主循环中轮询调用
- * @note  ISR 中仅设置 INIT 位和标志，实际重初始化在此处完成，
- *        避免在中断中执行长延时阻塞其他同优先级中断
+ * @note  ISR 中仅设置 INIT 位和标志，恢复延时在主循环中非阻塞完成
  */
 void FDCAN_PollBusOffRecovery(void) {
-  if (!s_busoff_recovery_pending)
+  const uint32_t current_tick = HAL_GetTick();
+
+  if (!s_busoff_recovery_pending) {
     return;
+  }
+
+  if (s_busoff_recovery_deadline == 0U) {
+    s_busoff_recovery_deadline = current_tick + BUS_OFF_RECOVERY_DELAY_MS;
+    return;
+  }
+
+  if ((int32_t)(current_tick - s_busoff_recovery_deadline) < 0) {
+    return;
+  }
 
   s_busoff_recovery_pending = 0;
-  HAL_Delay(10); /* 等待控制器稳定 */
-  HAL_FDCAN_DeInit(&hfdcan1);
-  CanOpen();
+  s_busoff_recovery_deadline = 0;
+  (void)CanOpen();
 }

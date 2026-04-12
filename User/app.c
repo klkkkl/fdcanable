@@ -8,6 +8,29 @@ extern volatile uint8_t usb_tx_busy;
 
 /* USB 最大包大小 (Full Speed CDC) */
 #define USB_TX_PKT_SIZE 64
+#define WORK_LED_HOLD_MS 50U
+#define STATE_LED_BLINK_MS 500U
+
+static uint32_t USB_TxBuf_GetContiguousLength(uint32_t head, uint32_t tail) {
+  if (head > tail) {
+    return head - tail;
+  }
+
+  return TX_BUF_SIZE - tail;
+}
+
+static void App_UpdateLeds(uint32_t current_tick, uint32_t *last_work_led_tick,
+                           uint32_t *last_state_led_tick) {
+  if ((current_tick - *last_work_led_tick) >= WORK_LED_HOLD_MS) {
+    LED_WORK_OFF();
+    *last_work_led_tick = current_tick;
+  }
+
+  if ((current_tick - *last_state_led_tick) >= STATE_LED_BLINK_MS) {
+    LED_STATE_TOGGLE();
+    *last_state_led_tick = current_tick;
+  }
+}
 
 /**
  * @brief USB TX 数据泵，处理 CAN->USB 数据传输
@@ -32,16 +55,8 @@ void Process_USB_TX_Pump(void) {
     return;
   }
 
-  /* 计算可发送数据长度（处理环形缓冲区回绕） */
   static uint8_t pkt[USB_TX_PKT_SIZE];
-  uint32_t len;
-
-  if (head > tail) {
-    len = head - tail;
-  } else {
-    /* 先发送到缓冲区末尾的数据 */
-    len = TX_BUF_SIZE - tail;
-  }
+  uint32_t len = USB_TxBuf_GetContiguousLength(head, tail);
 
   /* 限制单次传输大小 */
   if (len > USB_TX_PKT_SIZE) {
@@ -78,17 +93,6 @@ void AppRun(void) {
 
     /* 获取当前系统时钟 */
     const uint32_t current_tick = HAL_GetTick();
-
-    /* WORK LED: 每 50ms 复位，产生数据活动闪烁效果 */
-    if ((current_tick - last_work_led_tick) >= 50) {
-      LED_WORK_OFF();
-      last_work_led_tick = current_tick;
-    }
-
-    /* STATE LED: 每 500ms 闪烁，指示系统运行状态 */
-    if ((current_tick - last_state_led_tick) >= 500) {
-      LED_STATE_TOGGLE();
-      last_state_led_tick = current_tick;
-    }
+    App_UpdateLeds(current_tick, &last_work_led_tick, &last_state_led_tick);
   }
 }
