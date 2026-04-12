@@ -177,27 +177,45 @@ static inline uint32_t GetFdcanDlc(uint8_t len) {
 }
 
 /**
- * @brief 向 USB 发送缓冲区写入字符串（中断安全）
- * @param s 要写入的字符串
- * @note  通过禁用中断保证原子性，防止多生产者竞争
- */
-/**
- * @brief 向 USB 发送缓冲区写入字符串（在中断中调用）
- * @param s 要写入的字符串
+ * @brief 向 USB 发送缓冲区批量写入数据
+ * @param data 数据指针
+ * @param len  数据长度
+ * @return 实际写入的字节数
  * @note  SPSC 无锁设计：生产者只修改 head，读取 volatile tail
  *        消费者只修改 tail，读取 volatile head
- *        无需关中断保护，volatile 确保内存可见性
+ *        所有生产者（FDCAN/TIM3/USB 中断）必须在同一优先级，防止抢占导致 head 竞争
+ */
+static uint32_t USB_TxBuf_Write(const char *data, uint32_t len) {
+  const uint32_t head = g_usb_tx_fifo.head;
+  const uint32_t tail = g_usb_tx_fifo.tail;
+
+  /* 计算可用空间（保留一个字节区分满/空） */
+  uint32_t avail = (tail - head - 1) & TX_BUF_MASK;
+  if (len > avail) {
+    len = avail;
+  }
+  if (len == 0)
+    return 0;
+
+  /* 从 head 到缓冲区末尾的连续空间 */
+  const uint32_t first = TX_BUF_SIZE - head;
+  if (len <= first) {
+    memcpy(&g_usb_tx_fifo.buffer[head], data, len);
+  } else {
+    memcpy(&g_usb_tx_fifo.buffer[head], data, first);
+    memcpy(&g_usb_tx_fifo.buffer[0], data + first, len - first);
+  }
+
+  g_usb_tx_fifo.head = (head + len) & TX_BUF_MASK;
+  return len;
+}
+
+/**
+ * @brief 向 USB 发送缓冲区写入字符串
+ * @param s 要写入的字符串
  */
 void USB_TxBuf_WriteString(const char *s) {
-  while (*s) {
-    uint32_t next = (g_usb_tx_fifo.head + 1) % TX_BUF_SIZE;
-    if (next != g_usb_tx_fifo.tail) {
-      g_usb_tx_fifo.buffer[g_usb_tx_fifo.head] = *s++;
-      g_usb_tx_fifo.head = next;
-    } else {
-      break; /* 缓冲区满 */
-    }
-  }
+  USB_TxBuf_Write(s, strlen(s));
 }
 
 /* 快速格式化 CAN 报文为 SLCAN 字符串 (查表法替代 sprintf) */
@@ -245,9 +263,8 @@ void SLCAN_FormatResponse_Fast(FDCAN_RxHeaderTypeDef *RxHeader,
     }
   }
   *p++ = '\r';
-  *p = '\0';
 
-  USB_TxBuf_WriteString(msg);
+  USB_TxBuf_Write(msg, (uint32_t)(p - msg));
   LED_WORK_TOGGLE();
 }
 
@@ -359,7 +376,7 @@ CAN_Status_t SLCAN_ProcessCommand(char *cmd, char *response) {
     char *p = response;
     *p++ = 'V';
     /* 版本号 */
-    const char ver[] = "1111";
+    const char ver[] = SLCAN_FW_VERSION;
     for (const char *v = ver; *v;)
       *p++ = *v++;
     /* 追加 96-bit MCU Unique ID (24 hex chars) */
@@ -377,7 +394,7 @@ CAN_Status_t SLCAN_ProcessCommand(char *cmd, char *response) {
 
   /* 查询序列号 */
   case 'N':
-    strcpy(response, "NFDCAN");
+    strcpy(response, "N" SLCAN_SERIAL_NAME);
     return CAN_OK;
 
   /* 查询状态标志 */
@@ -487,6 +504,9 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
   }
 }
 
+/* Bus-Off 恢复标志（ISR 设置，主循环轮询处理） */
+static volatile uint8_t s_busoff_recovery_pending = 0;
+
 void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan,
                                    uint32_t ErrorStatusITs) {
   FDCAN_ProtocolStatusTypeDef protStatus;
@@ -495,13 +515,9 @@ void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan,
     HAL_FDCAN_GetProtocolStatus(hfdcan, &protStatus);
 
     if (protStatus.BusOff == 1) {
-      /* 离线后尝试恢复：先进入INIT，延时，重新初始化并打开通道 */
+      /* 立即进入 INIT 模式停止控制器，延迟恢复交给主循环 */
       SET_BIT(hfdcan->Instance->CCCR, FDCAN_CCCR_INIT);
-      for (volatile uint32_t i = 0; i < 800000; ++i) {
-        __NOP();
-      } // 简单延时约10ms@160MHz
-      HAL_FDCAN_DeInit(hfdcan);
-      CanOpen();
+      s_busoff_recovery_pending = 1;
     }
     USB_TxBuf_WriteString("E\r"); /* 发送总线错误状态 */
   }
@@ -535,4 +551,19 @@ void FDCAN_CheckBusStatus(void) {
   } else {
     s_bus_offline_secs = 0;
   }
+}
+
+/**
+ * @brief Bus-Off 延迟恢复，在主循环中轮询调用
+ * @note  ISR 中仅设置 INIT 位和标志，实际重初始化在此处完成，
+ *        避免在中断中执行长延时阻塞其他同优先级中断
+ */
+void FDCAN_PollBusOffRecovery(void) {
+  if (!s_busoff_recovery_pending)
+    return;
+
+  s_busoff_recovery_pending = 0;
+  HAL_Delay(10); /* 等待控制器稳定 */
+  HAL_FDCAN_DeInit(&hfdcan1);
+  CanOpen();
 }

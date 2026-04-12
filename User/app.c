@@ -57,7 +57,7 @@ void Process_USB_TX_Pump(void) {
     usb_tx_busy = 0; /* 发送失败，重置标志 */
   } else {
     /* 更新尾指针（usb_tx_busy 保护确保安全） */
-    g_usb_tx_fifo.tail = (tail + len) % TX_BUF_SIZE;
+    g_usb_tx_fifo.tail = (tail + len) & TX_BUF_MASK;
   }
 }
 
@@ -72,6 +72,9 @@ void AppRun(void) {
   while (1) {
     /* 处理 USB 发送队列 */
     Process_USB_TX_Pump();
+
+    /* Bus-Off 延迟恢复 */
+    FDCAN_PollBusOffRecovery();
 
     /* 获取当前系统时钟 */
     const uint32_t current_tick = HAL_GetTick();

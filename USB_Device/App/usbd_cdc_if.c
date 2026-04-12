@@ -281,9 +281,11 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
         CAN_Status_t status = SLCAN_ProcessCommand(slcan_cmd_buf, resp);
 
         if (status == CAN_OK) {
-          /* 发送响应 */
+          /* 发送响应或 SLCAN ACK */
           if (resp[0] != '\0') {
             USB_TxBuf_WriteString(resp);
+          } else {
+            USB_TxBuf_WriteString("\r");
           }
         }
 

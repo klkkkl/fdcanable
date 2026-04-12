@@ -12,8 +12,15 @@ extern "C" {
 
 /* ==================== 配置参数 ==================== */
 #define TX_BUF_SIZE 4096U      /* CAN -> USB 环形缓冲区大小 */
+#define TX_BUF_MASK (TX_BUF_SIZE - 1)
+_Static_assert((TX_BUF_SIZE & TX_BUF_MASK) == 0,
+               "TX_BUF_SIZE must be a power of 2");
+
 #define SLCAN_CMD_MAX_LEN 150U /* USB -> CAN 命令最大长度 */
 #define BUS_OFFLINE_THRESHOLD 3U /* 总线离线重启阈值（秒） */
+
+#define SLCAN_FW_VERSION  "1111"
+#define SLCAN_SERIAL_NAME "NFDCAN"
 
 /* ==================== LED 控制宏 ==================== */
 /* 假设 CubeMX 中已命名为 LED_STATE 和 LED_WORK */
@@ -50,6 +57,8 @@ typedef enum {
  *        volatile 确保编译器不优化内存访问，无需额外同步机制
  *        head: 写入位置，由生产者更新
  *        tail: 读取位置，由消费者更新
+ * @warning 所有写入 head 的中断（FDCAN/TIM3/USB）必须配置为相同优先级，
+ *          防止抢占导致 head 指针竞争。修改中断优先级前请评估此约束。
  */
 typedef struct {
   uint8_t buffer[TX_BUF_SIZE];
@@ -104,6 +113,11 @@ void USB_TxBuf_WriteString(const char *s);
  *        检测总线离线状态，发送错误通知，超时后重启总线
  */
 void FDCAN_CheckBusStatus(void);
+
+/**
+ * @brief Bus-Off 延迟恢复，在主循环中轮询调用
+ */
+void FDCAN_PollBusOffRecovery(void);
 
 #ifdef __cplusplus
 }
