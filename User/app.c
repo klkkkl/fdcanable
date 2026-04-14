@@ -9,7 +9,11 @@ extern volatile uint8_t usb_tx_busy;
 /* USB 最大包大小 (Full Speed CDC) */
 #define USB_TX_PKT_SIZE 64
 #define WORK_LED_HOLD_MS 50U
-#define STATE_LED_BLINK_MS 500U
+#define STATE_LED_BLINK_MS 50U
+
+static volatile uint32_t s_work_led_deadline = 0;
+static volatile uint32_t s_state_led_deadline = 0;
+static volatile uint8_t s_can_online = 0;
 
 static uint32_t USB_TxBuf_GetContiguousLength(uint32_t head, uint32_t tail) {
   if (head > tail) {
@@ -19,16 +23,44 @@ static uint32_t USB_TxBuf_GetContiguousLength(uint32_t head, uint32_t tail) {
   return TX_BUF_SIZE - tail;
 }
 
-static void App_UpdateLeds(uint32_t current_tick, uint32_t *last_work_led_tick,
-                           uint32_t *last_state_led_tick) {
-  if ((current_tick - *last_work_led_tick) >= WORK_LED_HOLD_MS) {
+static void App_UpdateLeds(uint32_t current_tick) {
+  if ((int32_t)(current_tick - s_work_led_deadline) >= 0) {
     LED_WORK_OFF();
-    *last_work_led_tick = current_tick;
+  } else {
+    LED_WORK_ON();
   }
 
-  if ((current_tick - *last_state_led_tick) >= STATE_LED_BLINK_MS) {
-    LED_STATE_TOGGLE();
-    *last_state_led_tick = current_tick;
+  if (!s_can_online) {
+    LED_STATE_OFF();
+  } else if ((int32_t)(current_tick - s_state_led_deadline) < 0) {
+    LED_STATE_OFF();
+  } else {
+    LED_STATE_ON();
+  }
+}
+
+void App_NotifyUsbActivity(void) {
+  s_work_led_deadline = HAL_GetTick() + WORK_LED_HOLD_MS;
+  LED_WORK_ON();
+}
+
+void App_NotifyCanRxActivity(void) {
+  if (!s_can_online) {
+    return;
+  }
+
+  s_state_led_deadline = HAL_GetTick() + STATE_LED_BLINK_MS;
+  LED_STATE_OFF();
+}
+
+void App_SetCanOnline(uint8_t online) {
+  s_can_online = online ? 1U : 0U;
+  s_state_led_deadline = 0U;
+
+  if (s_can_online) {
+    LED_STATE_ON();
+  } else {
+    LED_STATE_OFF();
   }
 }
 
@@ -80,9 +112,8 @@ void Process_USB_TX_Pump(void) {
  * @brief 应用程序主循环
  */
 void AppRun(void) {
-  /* LED 控制时间戳 */
-  uint32_t last_work_led_tick = 0;
-  uint32_t last_state_led_tick = 0;
+  App_SetCanOnline(0);
+  LED_WORK_OFF();
 
   while (1) {
     /* 处理 USB 发送队列 */
@@ -93,6 +124,6 @@ void AppRun(void) {
 
     /* 获取当前系统时钟 */
     const uint32_t current_tick = HAL_GetTick();
-    App_UpdateLeds(current_tick, &last_work_led_tick, &last_state_led_tick);
+    App_UpdateLeds(current_tick);
   }
 }

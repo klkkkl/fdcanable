@@ -108,9 +108,25 @@ void Process_USB_TX_Pump(void);
 void USB_TxBuf_WriteString(const char *s);
 
 /**
+ * @brief 通知发生了一次 USB 收发活动，WORK LED 短暂点亮
+ */
+void App_NotifyUsbActivity(void);
+
+/**
+ * @brief 通知收到了一帧 CAN 数据，STATE LED 在在线状态下短暂闪烁
+ */
+void App_NotifyCanRxActivity(void);
+
+/**
+ * @brief 设置当前 CAN 总线在线状态
+ * @param online 1 表示在线常亮，0 表示离线熄灭
+ */
+void App_SetCanOnline(uint8_t online);
+
+/**
  * @brief 检测 FDCAN 总线状态并处理离线情况
  * @note  在定时器中断中调用（1 秒一次）
- *        检测总线离线状态，发送错误通知，超时后重启总线
+ *        检测总线离线状态，超时后重启总线
  */
 void FDCAN_CheckBusStatus(void);
 

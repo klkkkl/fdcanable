@@ -48,12 +48,16 @@ typedef struct {
   uint8_t nominalIdx; /* 标称波特率配置索引 */
   uint8_t dataIdx;    /* 数据波特率配置索引 */
   uint8_t isDataBitrateSet;
+  uint8_t isSilentMode;
+  uint8_t autoRetransmission;
   uint8_t isOpen;
 } FDCAN_Config_t;
 
 static FDCAN_Config_t mCfg = {.nominalIdx = 6, /* 默认 S6: 500 kbps */
                               .dataIdx = 1,    /* 默认 Y2: 2 Mbps */
                               .isDataBitrateSet = 1,
+                              .isSilentMode = 0,
+                              .autoRetransmission = 1,
                               .isOpen = 0};
 
 typedef struct {
@@ -144,7 +148,7 @@ static const FDCAN_TimingConfig_t nom_timing_table[] = {
 };
 static const uint8_t nom_timing_cmd_values[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 10};
 
-/* FD 数据波特率时序配置表 (Y1-Y5, Y8) - 160 MHz, 80% 采样点 */
+/* FD 数据波特率时序配置表 (Yn 对应 n Mbps，Y8 为 8 Mbps) - 160 MHz */
 static const FDCAN_TimingConfig_t data_timing_table[] = {
     /* Y1: 1 Mbps  - 160MHz / (4 * 40) = 1000000, SP = 32/40 = 80% */
     {.bitrate = 1000000,
@@ -158,25 +162,25 @@ static const FDCAN_TimingConfig_t data_timing_table[] = {
      .timeSeg1 = 31,
      .timeSeg2 = 8,
      .sjw = 4},
-    /* Y3: 4 Mbps  - 160MHz / (2 * 20) = 4000000, SP = 16/20 = 80% */
+    /* Y3: 3 Mbps 目标值，当前配置约 2.963 Mbps - 160MHz / (2 * 27) */
+    {.bitrate = 2962963,
+     .prescaler = 2,
+     .timeSeg1 = 21,
+     .timeSeg2 = 5,
+     .sjw = 2},
+    /* Y4: 4 Mbps  - 160MHz / (2 * 20) = 4000000, SP = 16/20 = 80% */
     {.bitrate = 4000000,
      .prescaler = 2,
      .timeSeg1 = 15,
      .timeSeg2 = 4,
      .sjw = 2},
-    /* Y4: 5 Mbps  - 160MHz / (2 * 16) = 5000000, SP = 13/16 = 81.25% */
+    /* Y5: 5 Mbps  - 160MHz / (2 * 16) = 5000000, SP = 13/16 = 81.25% */
     {.bitrate = 5000000,
      .prescaler = 2,
      .timeSeg1 = 12,
      .timeSeg2 = 3,
      .sjw = 2},
-    /* Y5: 8 Mbps  - 160MHz / (2 * 10) = 8000000, SP = 8/10 = 80% */
-    {.bitrate = 8000000,
-     .prescaler = 2,
-     .timeSeg1 = 7,
-     .timeSeg2 = 2,
-     .sjw = 2},
-    /* Y8: 8 Mbps  - 与 Y5 共用 8Mbps 时序，提供协议别名 */
+    /* Y8: 8 Mbps  - 160MHz / (2 * 10) = 8000000, SP = 8/10 = 80% */
     {.bitrate = 8000000,
      .prescaler = 2,
      .timeSeg1 = 7,
@@ -381,8 +385,25 @@ static void BuildSerialResponse(char *response) {
   *p = '\0';
 }
 
-static void WriteBusErrorNotification(void) {
-  (void)USB_TxBuf_Write("E\r", 2U);
+static void AppendHexByte(char **response, uint8_t value) {
+  *(*response)++ = hex_table[(value >> 4) & 0x0F];
+  *(*response)++ = hex_table[value & 0x0F];
+}
+
+static void BuildErrorStatusResponse(char *response) {
+  FDCAN_ProtocolStatusTypeDef protocol_status;
+  FDCAN_ErrorCountersTypeDef error_counters;
+  char *p = response;
+
+  (void)HAL_FDCAN_GetProtocolStatus(&hfdcan1, &protocol_status);
+  (void)HAL_FDCAN_GetErrorCounters(&hfdcan1, &error_counters);
+
+  *p++ = 'E';
+  AppendHexByte(&p, (uint8_t)error_counters.TxErrorCnt);
+  AppendHexByte(&p, (uint8_t)error_counters.RxErrorCnt);
+  *p++ = hex_table[protocol_status.LastErrorCode & 0x0F];
+  *p++ = '\r';
+  *p = '\0';
 }
 
 static uint8_t HasNoTrailingArgs(const char *cmd) {
@@ -432,6 +453,40 @@ static CAN_Status_t HandleDataBitrateCommand(const char *cmd) {
   mCfg.dataIdx = (uint8_t)idx;
   mCfg.isDataBitrateSet = 1;
   return CAN_OK;
+}
+
+static CAN_Status_t HandleModeCommand(const char *cmd) {
+  if (mCfg.isOpen || cmd[1] == '\0' || cmd[2] != '\0') {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  switch (cmd[1]) {
+  case '0':
+    mCfg.isSilentMode = 0;
+    return CAN_OK;
+  case '1':
+    mCfg.isSilentMode = 1;
+    return CAN_OK;
+  default:
+    return CAN_ERR_PARAM_INVALID;
+  }
+}
+
+static CAN_Status_t HandleAutoRetransmissionCommand(const char *cmd) {
+  if (mCfg.isOpen || cmd[1] == '\0' || cmd[2] != '\0') {
+    return CAN_ERR_PARAM_INVALID;
+  }
+
+  switch (cmd[1]) {
+  case '0':
+    mCfg.autoRetransmission = 0;
+    return CAN_OK;
+  case '1':
+    mCfg.autoRetransmission = 1;
+    return CAN_OK;
+  default:
+    return CAN_ERR_PARAM_INVALID;
+  }
 }
 
 static CAN_Status_t HandleTxCommand(const char *cmd, char type) {
@@ -503,7 +558,6 @@ static CAN_Status_t HandleTxCommand(const char *cmd, char type) {
     return CAN_ERR_HAL_INIT;
   }
 
-  LED_WORK_TOGGLE();
   return CAN_OK;
 }
 
@@ -597,12 +651,17 @@ void SLCAN_FormatResponse_Fast(FDCAN_RxHeaderTypeDef *RxHeader,
   *p++ = '\r';
 
   USB_TxBuf_Write(msg, (uint32_t)(p - msg));
-  LED_WORK_TOGGLE();
+  App_NotifyCanRxActivity();
 }
 
 /* 打开 CAN 通道 */
 CAN_Status_t CanOpen(void) {
   StopCanController();
+
+  hfdcan1.Init.Mode =
+      mCfg.isSilentMode ? FDCAN_MODE_BUS_MONITORING : FDCAN_MODE_NORMAL;
+  hfdcan1.Init.AutoRetransmission =
+      mCfg.autoRetransmission ? ENABLE : DISABLE;
 
   /* 使用预计算的标称位时序配置 */
   const FDCAN_TimingConfig_t *nomTiming = &nom_timing_table[mCfg.nominalIdx];
@@ -655,7 +714,7 @@ CAN_Status_t CanOpen(void) {
 
   mCfg.isOpen = 1;
   ResetBusRecoveryState();
-  LED_STATE_ON();
+  App_SetCanOnline(1);
   return CAN_OK;
 }
 
@@ -663,7 +722,7 @@ CAN_Status_t CanOpen(void) {
 void CanClose(void) {
   StopCanController();
   ResetBusRecoveryState();
-  LED_STATE_OFF();
+  App_SetCanOnline(0);
 }
 
 /* 处理 USB 发来的 SLCAN 指令 */
@@ -679,9 +738,17 @@ CAN_Status_t SLCAN_ProcessCommand(char *cmd, char *response) {
   case 'S':
     return HandleStandardBitrateCommand(cmd);
 
-  /* 设置 FD 数据波特率 Y1-Y5 */
+  /* 设置 FD 数据波特率 Yn，对应 n Mbps */
   case 'Y':
     return HandleDataBitrateCommand(cmd);
+
+  /* 设置工作模式: M0 正常, M1 静默 */
+  case 'M':
+    return HandleModeCommand(cmd);
+
+  /* 设置自动重发: A0 关闭, A1 开启 */
+  case 'A':
+    return HandleAutoRetransmissionCommand(cmd);
 
   /* 打开 CAN 通道 */
   case 'O':
@@ -720,6 +787,14 @@ CAN_Status_t SLCAN_ProcessCommand(char *cmd, char *response) {
       return CAN_ERR_PARAM_INVALID;
     }
     strcpy(response, "F00\r");
+    return CAN_OK;
+
+  /* 查询当前 TEC/REC/LEC */
+  case 'E':
+    if (!HasNoTrailingArgs(cmd)) {
+      return CAN_ERR_PARAM_INVALID;
+    }
+    BuildErrorStatusResponse(response);
     return CAN_OK;
 
   /* 发送数据帧/远程帧: t/T/r/R */
@@ -771,15 +846,14 @@ void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan,
       SET_BIT(hfdcan->Instance->CCCR, FDCAN_CCCR_INIT);
       s_busoff_recovery_pending = 1;
       s_busoff_recovery_deadline = 0;
+      App_SetCanOnline(0);
     }
-    WriteBusErrorNotification();
   }
 }
 
 /**
  * @brief 检测 FDCAN 总线状态，在 TIM3 中断（1 秒）中调用
- * @note  - 总线离线时每秒向上位机发送 "E\r"
- *        - 离线超过 BUS_OFFLINE_THRESHOLD 秒后重启总线
+ * @note  - 总线离线超过 BUS_OFFLINE_THRESHOLD 秒后重启总线
  *        - 总线恢复正常后清零计数器
  */
 void FDCAN_CheckBusStatus(void) {
@@ -792,7 +866,7 @@ void FDCAN_CheckBusStatus(void) {
 
   if (protStatus.BusOff) {
     s_bus_offline_secs++;
-    WriteBusErrorNotification();
+    App_SetCanOnline(0);
 
     if (s_bus_offline_secs >= BUS_OFFLINE_THRESHOLD) {
       s_bus_offline_secs = 0;
@@ -800,6 +874,7 @@ void FDCAN_CheckBusStatus(void) {
     }
   } else {
     s_bus_offline_secs = 0;
+    App_SetCanOnline(1);
   }
 }
 

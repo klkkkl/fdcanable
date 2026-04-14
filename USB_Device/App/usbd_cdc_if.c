@@ -269,6 +269,10 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   /* USER CODE BEGIN 6 */
   const uint32_t len = *Len;
 
+  if (len > 0U) {
+    App_NotifyUsbActivity();
+  }
+
   for (uint32_t i = 0; i < len; i++) {
     const uint8_t ch = Buf[i];
 
@@ -331,6 +335,9 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
   }
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, Buf, Len);
   result = USBD_CDC_TransmitPacket(&hUsbDeviceFS);
+  if (result == USBD_OK && Len > 0U) {
+    App_NotifyUsbActivity();
+  }
   /* USER CODE END 7 */
   return result;
 }
